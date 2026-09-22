@@ -293,7 +293,7 @@
       <p>A second audit, separate from the corner/compensation one above, checks how deep every toolpath actually cuts and flags a couple of nest-design patterns worth a second look. It applies to Fanuc-style G-code and Maestro <code>.xcs</code> files.</p>
       <ul>
         <li><strong>Depth audit</strong> &mdash; on Onsrud/Fanuc <code>.anc</code> files, the spoilboard surface is Z0; up to 0.1mm below that is normal blow-through and isn't flagged. Between 0.1mm and 0.25mm past Z0 gets a <span class="tagPill depth-yellow">DEPTH</span> review flag; 0.25mm or deeper gets a <span class="tagPill depth-red">DEPTH &#9888;</span> hard-limit flag. On Biesse X200 <code>.xcs</code> files the same two tiers apply, measured against blank thickness + tolerance instead of Z0, for both routing passes and drill depths.</li>
-        <li><strong>Tabs</strong> &mdash; a <span class="tagPill tab">TABS</span> pill marks every machining tab: on xcs this comes directly from the file's own <code>SetAttribute("TAB", ...)</code> calls; on G-code it's inferred from the path lifting 0-0.3mm for roughly 15-90mm of travel before dropping back down (a normal full-height retract isn't flagged).</li>
+        <li><strong>Tabs</strong> &mdash; on xcs this comes directly from the file's own <code>SetAttribute("TAB", ...)</code> calls; on G-code it's inferred from the path lifting a few mm for roughly 15&ndash;90mm of travel before dropping back down (a normal full-height retract isn't flagged). A file with any tabs gets a <span class="tagPill tab">TABS</span> tag next to its name in the file list. On the canvas, each G-code tab draws as a solid red line over its exact lift/travel/drop-back bump &mdash; but only once the scrub/play animation has actually cut through it, same as the rest of the toolpath. Hover the red line for a tooltip with bottom Z, top Z, and tab length in mm and inches.</li>
         <li><strong>Onion-skin (xcs only)</strong> &mdash; a &#129477; appears where the same path is routed twice: once shallow (above the blank) and once as a full thru-cut. If either pass also carries a tab, a <span class="tagPill tab">TABS</span> pill is shown alongside it.</li>
       </ul>
       <p>Findings live in a <strong>Depth, tabs &amp; onion-skin</strong> list in the info panel &mdash; click one to jump the code panel and highlight it on the canvas. Tab pills and onion emoji are always visible on the canvas at a glance; depth issues highlight on click, since a single deep run can span many lines.</p>
@@ -995,6 +995,11 @@ function detectTabIssues(program){
     // localized bump (not a full-height retract, which is 'rapid' and already
     // excluded below) rather than a multi-mm plunge/ramp move.
     const LIFT_MAX = 5, TRAVEL_MIN = 15, TRAVEL_MAX = 90; // mm
+    // Needed to know each tab's position in program.moves (the same index space
+    // as state.scrub) so the canvas can gate the red bump line on animation
+    // progress — the filtered array below doesn't preserve original indices.
+    const indexOfMove = new Map();
+    program.moves.forEach((mv, idx)=> indexOfMove.set(mv, idx));
     const moves = program.moves.filter(mv=> mv.start && mv.end && (mv.type==='linear' || mv.type==='arcCW' || mv.type==='arcCCW'));
     let i = 0;
     while(i < moves.length){
@@ -1016,9 +1021,12 @@ function detectTabIssues(program){
           const segs = liftMoves.map(mv=>({x1:mv.start.x, y1:mv.start.y, x2:mv.end.x, y2:mv.end.y}));
           const maxLift = Math.max(...liftMoves.map(mv=>mv.end.z)) - baseZ;
           const bottomZ = baseZ, topZ = baseZ + maxLift, lengthMm = travel;
+          // The bump is only "complete" (and so only drawn) once the animation
+          // has actually cut through the drop-back-down move.
+          const passMoveIndex = indexOfMove.get(backDown);
           issues.push({
             id: 'tab-'+(seq++), type:'tab', lineNo: liftMoves[0].lineNo,
-            lines: liftMoves.map(mv=>mv.lineNo), segs,
+            lines: liftMoves.map(mv=>mv.lineNo), segs, passMoveIndex, passLineNo: backDown.lineNo,
             bottomZ, topZ, lengthMm,
             title: `~${travel.toFixed(0)}mm bridge, Z+${maxLift.toFixed(2)}mm`,
             detail: `Path lifts up to ${maxLift.toFixed(2)}mm over ~${travel.toFixed(0)}mm of travel before returning to Z${baseZ.toFixed(2)}mm — a machining tab.`,
@@ -1654,11 +1662,13 @@ function renderFileList(){
     else meta = 'loading&hellip;';
     const hasDepthIssues = entry.programFlags && entry.programFlags.depth.length > 0;
     const hasRedDepthIssues = entry.programFlags && entry.programFlags.depth.some(d=>d.severity==='red');
+    const hasTabs = entry.programFlags && entry.programFlags.tabs.length > 0;
     const hasAuditIssues = (entry.issues && entry.issues.length > 0) || hasDepthIssues;
     const hasSevere = (entry.issues && entry.issues.some(i=>i.type==='shortSharp')) || hasRedDepthIssues;
-    const nameRow = hasAuditIssues
-      ? `<div class="name">${escapeHtml(entry.name)}<span class="fileAlertIcon${hasSevere?' severe':''}" data-tooltip="${escapeHtml(auditSummaryText(entry))}">&#9888;</span></div>`
-      : `<div class="name">${escapeHtml(entry.name)}</div>`;
+    const nameRow = `<div class="name">${escapeHtml(entry.name)}` +
+      (hasTabs ? `<span class="tagPill tab" style="margin-left:6px;" title="${entry.programFlags.tabs.length} tab${entry.programFlags.tabs.length===1?'':'s'} found">TABS</span>` : '') +
+      (hasAuditIssues ? `<span class="fileAlertIcon${hasSevere?' severe':''}" data-tooltip="${escapeHtml(auditSummaryText(entry))}">&#9888;</span>` : '') +
+      `</div>`;
     div.innerHTML = `<button type="button" class="fileDeleteBtn" title="Remove file">&#10005;</button>` +
       nameRow + `<div class="meta">${meta}</div>` +
       (entry.error ? `<div class="err">${escapeHtml(entry.error)}</div>` : '');
@@ -2032,7 +2042,10 @@ function renderProgramFlagsSection(entry){
     div.addEventListener('click', ()=>{
       entry.flagsActiveId = iss.id;
       renderProgramFlagsSection(entry);
-      jumpToLine(iss.lineNo);
+      // For gcode tabs, jump to the line where the bump finishes (not where it
+      // starts) so the red line is immediately past the animation's scrub
+      // position and actually visible, rather than one click short of it.
+      jumpToLine(iss.type === 'tab' && iss.passLineNo != null ? iss.passLineNo : iss.lineNo);
     });
     flagsListEl.appendChild(div);
   });
@@ -2925,7 +2938,10 @@ function drawPartLabelMarkers(){
 //
 // tabHoverRegions is rebuilt on every draw() and used by the canvas
 // mousemove listener (see wirePanZoom) to show a tooltip with bottom/top Z
-// and tab length when hovering a tab's red line or its [TABS] pill.
+// and tab length when hovering a tab's red bump line. There's no [TABS] pill
+// on the canvas anymore — a file that has any tabs gets a TABS tag in the
+// file list instead (see renderFileList), and the info panel's "Depth, tabs
+// & onion-skin" list still shows/jumps to every individual one.
 let tabHoverRegions = [];
 function drawProgramFlags(){
   tabHoverRegions = [];
@@ -2934,29 +2950,23 @@ function drawProgramFlags(){
   const { depth, tabs, onion } = entry.programFlags;
 
   tabs.forEach(t=>{
-    let px, py;
     // gcode tabs carry the actual lifted path (segs) — draw that in red so
-    // the exact stop/lift/travel/drop-back bump is visible on the perimeter,
-    // not just a label floating near it.
-    if(t.segs && t.segs.length){
-      ctx.save();
-      ctx.setLineDash([]);
-      ctx.lineWidth = 2.5;
-      ctx.strokeStyle = '#ff3b3b';
-      t.segs.forEach(s=>{
-        const [x1,y1] = toScreen(s.x1,s.y1);
-        const [x2,y2] = toScreen(s.x2,s.y2);
-        ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
-        tabHoverRegions.push({ type:'line', x1,y1,x2,y2, iss:t });
-      });
-      ctx.restore();
-      const mid = t.segs[Math.floor(t.segs.length/2)];
-      [px,py] = toScreen((mid.x1+mid.x2)/2, (mid.y1+mid.y2)/2);
-    } else if(t.point){
-      [px,py] = toScreen(t.point.x, t.point.y);
-    } else return;
-    const bbox = drawTagPill(px, py, '[TABS]', '#4f8cff');
-    tabHoverRegions.push({ type:'rect', x:bbox.x, y:bbox.y, w:bbox.w, h:bbox.h, iss:t });
+    // the exact stop/lift/travel/drop-back bump is visible on the perimeter.
+    // Only shown once the animation has actually cut through it, matching
+    // the rest of the toolpath's reveal-as-you-scrub behavior.
+    if(!t.segs || !t.segs.length) return;
+    if(t.passMoveIndex == null || state.scrub <= t.passMoveIndex) return;
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = '#ff3b3b';
+    t.segs.forEach(s=>{
+      const [x1,y1] = toScreen(s.x1,s.y1);
+      const [x2,y2] = toScreen(s.x2,s.y2);
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      tabHoverRegions.push({ type:'line', x1,y1,x2,y2, iss:t });
+    });
+    ctx.restore();
   });
 
   onion.forEach(o=>{
