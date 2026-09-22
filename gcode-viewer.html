@@ -989,7 +989,12 @@ function detectTabIssues(program){
       });
     });
   } else if(program.format === 'gcode'){
-    const LIFT_MAX = 0.3, TRAVEL_MIN = 15, TRAVEL_MAX = 90; // mm
+    // Real tabs on Onsrud posts observed so far lift ~1.6mm over ~40mm of travel,
+    // but "a few mm" lifts are the norm — 0.3mm was too tight and missed every
+    // real tab in a whole batch of files. TRAVEL_MIN/MAX bound it to a short,
+    // localized bump (not a full-height retract, which is 'rapid' and already
+    // excluded below) rather than a multi-mm plunge/ramp move.
+    const LIFT_MAX = 5, TRAVEL_MIN = 15, TRAVEL_MAX = 90; // mm
     const moves = program.moves.filter(mv=> mv.start && mv.end && (mv.type==='linear' || mv.type==='arcCW' || mv.type==='arcCCW'));
     let i = 0;
     while(i < moves.length){
@@ -1010,9 +1015,11 @@ function detectTabIssues(program){
         if(backDown && Math.abs(backDown.end.z - baseZ) < 0.05){
           const segs = liftMoves.map(mv=>({x1:mv.start.x, y1:mv.start.y, x2:mv.end.x, y2:mv.end.y}));
           const maxLift = Math.max(...liftMoves.map(mv=>mv.end.z)) - baseZ;
+          const bottomZ = baseZ, topZ = baseZ + maxLift, lengthMm = travel;
           issues.push({
             id: 'tab-'+(seq++), type:'tab', lineNo: liftMoves[0].lineNo,
             lines: liftMoves.map(mv=>mv.lineNo), segs,
+            bottomZ, topZ, lengthMm,
             title: `~${travel.toFixed(0)}mm bridge, Z+${maxLift.toFixed(2)}mm`,
             detail: `Path lifts up to ${maxLift.toFixed(2)}mm over ~${travel.toFixed(0)}mm of travel before returning to Z${baseZ.toFixed(2)}mm — a machining tab.`,
           });
@@ -1764,6 +1771,40 @@ function showHoverTooltip(anchorEl, text){
 }
 function hideHoverTooltip(){
   if(hoverTooltipEl) hoverTooltipEl.style.display = 'none';
+}
+// Same tooltip element, but positioned near the cursor instead of anchored to
+// a DOM element's bounding box — used for hovering canvas-drawn tab markers.
+function showCanvasTooltip(clientX, clientY, text){
+  if(!text) return;
+  if(!hoverTooltipEl){
+    hoverTooltipEl = document.createElement('div');
+    hoverTooltipEl.id = 'hoverTooltip';
+    document.body.appendChild(hoverTooltipEl);
+  }
+  hoverTooltipEl.textContent = text;
+  hoverTooltipEl.style.display = 'block';
+  const tw = hoverTooltipEl.offsetWidth;
+  let left = clientX + 14;
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  hoverTooltipEl.style.left = left + 'px';
+  hoverTooltipEl.style.top = (clientY + 14) + 'px';
+}
+function distToSegment(px,py,x1,y1,x2,y2){
+  const dx=x2-x1, dy=y2-y1;
+  const lenSq = dx*dx+dy*dy;
+  let t = lenSq>0 ? ((px-x1)*dx+(py-y1)*dy)/lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = x1+t*dx, cy = y1+t*dy;
+  return Math.hypot(px-cx, py-cy);
+}
+// gcode tabs carry bottomZ/topZ/lengthMm (the exact lifted geometry); xcs tabs
+// only carry the file's own SetAttribute("TAB", value) — no bottom/top Z since
+// xcs routing ops store one depth per whole operation, not per segment.
+function tabTooltipText(iss){
+  if(iss.bottomZ != null && iss.topZ != null && iss.lengthMm != null){
+    return `Tab — bottom Z${iss.bottomZ.toFixed(3)}mm, top Z${iss.topZ.toFixed(3)}mm, length ${mmIn(iss.lengthMm)}`;
+  }
+  return `Micro-junction tab (attribute value ${iss.value})`;
 }
 
 function selectFile(id){
@@ -2598,7 +2639,7 @@ function updateZoomLabel(){
 
 function wirePanZoom(){
   let dragging = false, lastX=0, lastY=0;
-  canvas.addEventListener('mousedown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; canvas.classList.add('grabbing'); });
+  canvas.addEventListener('mousedown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; canvas.classList.add('grabbing'); hideHoverTooltip(); });
   window.addEventListener('mouseup', ()=>{ dragging=false; canvas.classList.remove('grabbing'); });
   window.addEventListener('mousemove', e=>{
     if(!dragging) return;
@@ -2608,6 +2649,24 @@ function wirePanZoom(){
     state.view.offsetY -= dy;
     draw();
   });
+  // Hover tooltip for tab markers (red bump line + [TABS] pill) — shows
+  // bottom/top Z and tab length. Skipped while panning.
+  canvas.addEventListener('mousemove', e=>{
+    if(dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let hit = null;
+    for(const r of tabHoverRegions){
+      if(r.type === 'rect'){
+        if(mx>=r.x && mx<=r.x+r.w && my>=r.y && my<=r.y+r.h){ hit=r; break; }
+      } else if(r.type === 'line'){
+        if(distToSegment(mx,my,r.x1,r.y1,r.x2,r.y2) <= 6){ hit=r; break; }
+      }
+    }
+    if(hit) showCanvasTooltip(e.clientX, e.clientY, tabTooltipText(hit.iss));
+    else hideHoverTooltip();
+  });
+  canvas.addEventListener('mouseleave', ()=> hideHoverTooltip());
   canvas.addEventListener('wheel', e=>{
     e.preventDefault();
     const rect = canvas.getBoundingClientRect();
@@ -2863,19 +2922,41 @@ function drawPartLabelMarkers(){
 // per-part context the user wants to see at a glance, not just on click.
 // Depth issues instead follow the same click-to-highlight pattern as the
 // corner audit below, since there can be many of them along one path.
+//
+// tabHoverRegions is rebuilt on every draw() and used by the canvas
+// mousemove listener (see wirePanZoom) to show a tooltip with bottom/top Z
+// and tab length when hovering a tab's red line or its [TABS] pill.
+let tabHoverRegions = [];
 function drawProgramFlags(){
+  tabHoverRegions = [];
   const entry = state.files.find(f=>f.id===state.activeFileId);
   if(!entry || !entry.programFlags) return;
   const { depth, tabs, onion } = entry.programFlags;
 
   tabs.forEach(t=>{
     let px, py;
-    if(t.point){ [px,py] = toScreen(t.point.x, t.point.y); }
-    else if(t.segs && t.segs.length){
+    // gcode tabs carry the actual lifted path (segs) — draw that in red so
+    // the exact stop/lift/travel/drop-back bump is visible on the perimeter,
+    // not just a label floating near it.
+    if(t.segs && t.segs.length){
+      ctx.save();
+      ctx.setLineDash([]);
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = '#ff3b3b';
+      t.segs.forEach(s=>{
+        const [x1,y1] = toScreen(s.x1,s.y1);
+        const [x2,y2] = toScreen(s.x2,s.y2);
+        ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+        tabHoverRegions.push({ type:'line', x1,y1,x2,y2, iss:t });
+      });
+      ctx.restore();
       const mid = t.segs[Math.floor(t.segs.length/2)];
       [px,py] = toScreen((mid.x1+mid.x2)/2, (mid.y1+mid.y2)/2);
+    } else if(t.point){
+      [px,py] = toScreen(t.point.x, t.point.y);
     } else return;
-    drawTagPill(px, py, '[TABS]', '#4f8cff');
+    const bbox = drawTagPill(px, py, '[TABS]', '#4f8cff');
+    tabHoverRegions.push({ type:'rect', x:bbox.x, y:bbox.y, w:bbox.w, h:bbox.h, iss:t });
   });
 
   onion.forEach(o=>{
@@ -2937,6 +3018,7 @@ function drawTagPill(px, py, text, color){
   ctx.textBaseline = 'middle';
   ctx.fillText(text, px, y + h/2 + 1);
   ctx.restore();
+  return { x, y, w, h };
 }
 
 // Highlights the currently-selected corner-audit finding (if any) on top of
